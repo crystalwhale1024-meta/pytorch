@@ -363,6 +363,29 @@ def annotate(annotation_dict: dict[str, Any]) -> Iterator[None]:
             del current_meta["custom"]
 
 
+# Key under node.meta["custom"] used to carry the activation-checkpointing
+# memory_budget set by ``torch.autograd.graph.region_memory_budget``. Shared by
+# that writer and the reader below so the partitioner / AOTAutograd cache read it
+# the same way.
+MEMORY_BUDGET_ANNOTATION_KEY = "memory_budget"
+
+
+def _get_memory_budget_annotation(node: Node) -> float | None:
+    """
+    Read the ``region_memory_budget`` annotation off an FX node, returning
+    ``None`` if absent. Defensive against ``custom`` being missing/``None`` and
+    against ``bool`` (a subclass of ``int``), so the accepted-value policy lives
+    in one place.
+    """
+    custom = node.meta.get("custom")
+    if not isinstance(custom, dict):
+        return None
+    budget = custom.get(MEMORY_BUDGET_ANNOTATION_KEY)
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)):
+        return None
+    return float(budget)
+
+
 @compatibility(is_backward_compatible=False)
 def annotate_fn(
     annotation_dict: dict[str, Any],

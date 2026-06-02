@@ -325,6 +325,9 @@ manual_torch_name_rule_map: dict[
     "torch.autograd.forward_ad.exit_dual_level": UserFunctionVariable,
     "torch.autograd.forward_ad.make_dual": UserFunctionVariable,
     "torch.autograd.forward_ad.unpack_dual": UserFunctionVariable,
+    # Thin wrapper over fx.traceback.annotate; inline so Dynamo reaches the
+    # annotate call (torch.autograd is otherwise in MOD_SKIPLIST).
+    "torch.autograd.graph.region_memory_budget": UserFunctionVariable,
     # functorch/linearize
     "torch._functorch.eager_transforms.linearize": FunctorchHigherOrderVariable,
     # functorch/jacfwd

@@ -45,6 +45,7 @@ __all__ = [
     "GradientEdge",
     "get_gradient_edge",
     "increment_version",
+    "region_memory_budget",
     "set_warn_on_accumulate_grad_stream_mismatch",
     "set_override_stale_capture_stream",
 ]
@@ -453,6 +454,56 @@ def disable_saved_tensors_hooks(error_message: str) -> Generator[None, None, Non
             torch._C._autograd._saved_tensors_hooks_enable()
         else:
             torch._C._autograd._saved_tensors_hooks_disable(maybe_prev_message)
+
+
+def region_memory_budget(
+    budget: float,
+) -> contextlib.AbstractContextManager[None]:
+    r"""Context-manager that sets the activation memory budget for the region of
+    a compiled forward traced under it.
+
+    Under :func:`torch.compile` / :func:`torch.export`, the min-cut partitioner
+    chooses which activations to save versus recompute in the backward pass to
+    stay under a memory budget. This overrides the global
+    ``torch._functorch.config.activation_memory_budget`` for the annotated
+    region. ``budget`` is a ratio in ``[0, 1]``: ``0.0`` recomputes the region in
+    the backward pass, ``1.0`` saves all of its activations, and intermediate
+    values solve a knapsack for the cheapest recompute that stays under budget.
+
+    .. note::
+        Today the partitioner applies a single budget per compiled graph, so you
+        must wrap the **entire** forward of a graph (including any final loss /
+        reduction) with one budget. Two constraints are enforced at partition
+        time, both raising ``RuntimeError``: the annotation must cover every
+        forward op in the graph (a partial annotation is rejected rather than
+        silently applied graph-wide), and all annotated nodes must agree on the
+        budget. To use different budgets for different parts of a model, separate
+        them with a graph break (e.g. ``torch._dynamo.graph_break()``) so each
+        part becomes its own graph. These constraints keep the door open to true
+        per-region budgets later without a backward-compatibility break.
+
+    Outside of the PT2 tracers this is a no-op.
+
+    Args:
+        budget (float): Activation memory budget ratio in ``[0, 1]``.
+
+    Example::
+
+        >>> # xdoctest: +SKIP
+        >>> with torch.autograd.graph.region_memory_budget(0.0):
+        ...     x = layer(x)  # recompute this region's activations in backward
+    """
+    import torch.fx.traceback as fx_traceback
+
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)):
+        raise TypeError(
+            f"region_memory_budget expects a float, got {type(budget).__name__}"
+        )
+    if not 0.0 <= budget <= 1.0:
+        raise ValueError(f"region_memory_budget must be in [0, 1], got {budget}")
+    return fx_traceback.annotate(
+        {fx_traceback.MEMORY_BUDGET_ANNOTATION_KEY: float(budget)}
+    )
 
 
 def set_warn_on_accumulate_grad_stream_mismatch(enabled: bool) -> None:

@@ -65,6 +65,7 @@ from torch.compiler._cache import (
 )
 from torch.fx.experimental.symbolic_shapes import guarding_hint_or_throw
 from torch.fx.node import Node
+from torch.fx.traceback import _get_memory_budget_annotation
 from torch.utils._triton import has_triton_package
 
 from .aot_autograd_result import (
@@ -509,6 +510,21 @@ class AOTAutogradCacheDetails(FxGraphHashDetails):
             _collect_saved_tensors_hooks_fx_wrap_cache_hashes(gm)
         )
         self.sac_context_fn_hashes = _collect_context_fn_hashes(gm)
+
+        # region_memory_budget annotations live in node.meta["custom"], which is
+        # stripped by GraphModule.__reduce__, so they would be invisible to the
+        # cache key. Extract them explicitly so that changing a region's budget
+        # invalidates the cache. Recurse into nested GraphModules (e.g.
+        # invoke_subgraph / SAC HOP bodies) and fold the owning module's
+        # qualified name into the key so per-module node indices stay distinct.
+        self.region_memory_budget_per_node: list[tuple[str, int, float]] = []
+        for module_name, module in gm.named_modules():
+            if not isinstance(module, torch.fx.GraphModule):
+                continue
+            for i, node in enumerate(module.graph.nodes):
+                budget = _get_memory_budget_annotation(node)
+                if budget is not None:
+                    self.region_memory_budget_per_node.append((module_name, i, budget))
 
         # Note: We use the live config module, not self.autograd_config (the
         # saved config), because activation_memory_budget_runtime_estimator and

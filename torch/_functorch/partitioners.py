@@ -49,6 +49,7 @@ from torch.fx.experimental.symbolic_shapes import (
     statically_known_true,
 )
 from torch.fx.passes import graph_drawer
+from torch.fx.traceback import _get_memory_budget_annotation
 from torch.utils._ordered_set import OrderedSet
 from torch.utils.checkpoint import CheckpointPolicy
 
@@ -3791,11 +3792,55 @@ def min_cut_rematerialization_partition(
             for user in node.users:
                 node.dist_from_bw = min(node.dist_from_bw, user.dist_from_bw + 1)
 
+    # memory_budget override resolution, in increasing precedence:
+    #   1. config.activation_memory_budget (global default).
+    #   2. Legacy node.meta["memory_budget"]; first matching node wins.
+    #   3. `torch.autograd.graph.region_memory_budget(...)`, read off
+    #      node.meta["custom"] via `_get_memory_budget_annotation`. It is
+    #      propagated onto every annotated node via _COPY_META_FIELDS["custom"]
+    #      and overrides the legacy reader.
+    # The partitioner applies a single budget per joint graph, so all annotated
+    # nodes must agree; disagreement means the caller used mutually exclusive
+    # budgets in one graph (across a graph break each graph is resolved
+    # independently).
     memory_budget = config.activation_memory_budget
     for node in joint_graph.nodes:
         if isinstance(node.meta.get("memory_budget", None), float):
             memory_budget = node.meta["memory_budget"]
             break
+
+    region_budgets = OrderedSet(
+        b
+        for node in joint_graph.nodes
+        if (b := _get_memory_budget_annotation(node)) is not None
+    )
+    if region_budgets:
+        if len(region_budgets) > 1:
+            raise RuntimeError(
+                f"Conflicting region_memory_budget values within a single joint "
+                f"graph: {sorted(region_budgets)}. The partitioner applies a "
+                f"single budget per graph; use a graph break to separate regions "
+                f"that need different budgets."
+            )
+        # The budget is applied graph-wide, so require the annotation to cover
+        # every forward op: a partial annotation is rejected rather than silently
+        # treated as graph-wide. This keeps the door open to true per-region
+        # budgets later without a BC break (today's uniform whole-forward usage
+        # would behave identically).
+        unannotated = [
+            n
+            for n in node_info.required_fw_nodes
+            if n.op == "call_function" and _get_memory_budget_annotation(n) is None
+        ]
+        if unannotated:
+            raise RuntimeError(
+                f"region_memory_budget must cover the entire forward of a graph, "
+                f"but {len(unannotated)} forward op(s) are unannotated (e.g. "
+                f"'{unannotated[0].name}'). Wrap the whole forward in a single "
+                f"region_memory_budget; use a graph break to scope different "
+                f"budgets to different graphs."
+            )
+        memory_budget = next(iter(region_budgets))
     saved_values = choose_saved_values_set(
         joint_graph,
         node_info,
