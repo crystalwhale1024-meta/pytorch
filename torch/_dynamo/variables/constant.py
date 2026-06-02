@@ -161,7 +161,10 @@ class ConstantVariable(VariableTracker):
         Need this when adding a BaseListVariable and a ConstantVariable together.
         Happens in detectron2.
         """
-        return self.unpack_var_sequence(tx=None)
+        try:
+            return [ConstantVariable.create(x) for x in self.value]
+        except TypeError as e:
+            raise NotImplementedError from e
 
     def getitem_const(
         self, tx: InstructionTranslatorBase, arg: VariableTracker
@@ -267,10 +270,13 @@ class ConstantVariable(VariableTracker):
         from .lists import ListIteratorVariable
 
         try:
-            items = self.unpack_var_sequence(tx)
+            return ListIteratorVariable(
+                [ConstantVariable.create(c) for c in self.value],
+                mutation_type=ValueMutationNew(),
+            )
         except NotImplementedError:
-            return super().tp_iter_impl(tx)
-        return ListIteratorVariable(items, mutation_type=ValueMutationNew())
+            pass
+        return super().tp_iter_impl(tx)
 
     def call_method(
         self,
