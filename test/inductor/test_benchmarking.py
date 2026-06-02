@@ -1,5 +1,6 @@
 # Owner(s): ["module: inductor"]
 
+import contextlib
 import unittest
 from unittest.mock import patch
 
@@ -335,6 +336,190 @@ class TestBenchmarker(TestCase):
             ),
             5.0,
         )
+
+    def test_gpu_benchmark_lock_without_registered_context_is_noop(self):
+        from torch._inductor.runtime import benchmarking as _bench
+
+        with patch(
+            "torch.cuda.current_device",
+            side_effect=AssertionError("should not query device"),
+        ):
+            with _bench.maybe_gpu_benchmark_lock():
+                pass
+
+    def test_gpu_benchmark_lock_uses_registered_context(self):
+        from torch._inductor.runtime import benchmarking as _bench
+
+        calls = []
+
+        @contextlib.contextmanager
+        def custom_context():
+            calls.append("enter")
+            try:
+                yield
+            finally:
+                calls.append("exit")
+
+        previous = _bench.set_gpu_benchmark_lock_context(custom_context)
+        try:
+            with patch(
+                "torch.cuda.current_device",
+                side_effect=AssertionError("custom context should not query device"),
+            ):
+                with _bench.maybe_gpu_benchmark_lock():
+                    calls.append("body")
+        finally:
+            _bench.set_gpu_benchmark_lock_context(previous)
+
+        self.assertEqual(calls, ["enter", "body", "exit"])
+
+    def test_set_gpu_benchmark_lock_context_returns_previous_context(self):
+        from torch._inductor.runtime import benchmarking as _bench
+
+        @contextlib.contextmanager
+        def first_context():
+            yield
+
+        @contextlib.contextmanager
+        def second_context():
+            yield
+
+        previous = _bench.set_gpu_benchmark_lock_context(first_context)
+        try:
+            self.assertIs(
+                _bench.set_gpu_benchmark_lock_context(second_context),
+                first_context,
+            )
+        finally:
+            _bench.set_gpu_benchmark_lock_context(previous)
+
+    def test_gpu_benchmark_lock_registered_context_is_reentrant(self):
+        from torch._inductor.runtime import benchmarking as _bench
+
+        calls = []
+        locked = False
+
+        @contextlib.contextmanager
+        def custom_context():
+            nonlocal locked
+            self.assertFalse(locked)
+            locked = True
+            calls.append("enter")
+            try:
+                yield
+            finally:
+                calls.append("exit")
+                locked = False
+
+        previous = _bench.set_gpu_benchmark_lock_context(custom_context)
+        try:
+            with _bench.maybe_gpu_benchmark_lock():
+                with _bench.maybe_gpu_benchmark_lock():
+                    calls.append("body")
+        finally:
+            _bench.set_gpu_benchmark_lock_context(previous)
+
+        self.assertEqual(calls, ["enter", "body", "exit"])
+
+    def test_do_bench_using_profiling_uses_gpu_benchmark_lock(self):
+        from torch._inductor import utils as inductor_utils
+        from torch._inductor.runtime import benchmarking as _bench
+
+        calls = []
+
+        @contextlib.contextmanager
+        def custom_context():
+            calls.append("enter")
+            try:
+                yield
+            finally:
+                calls.append("exit")
+
+        def fake_do_bench(fn, warmup, rep, is_vetted_benchmarking):
+            calls.append((warmup, rep, is_vetted_benchmarking))
+            fn()
+            return 3.0
+
+        previous = _bench.set_gpu_benchmark_lock_context(custom_context)
+        try:
+            with patch.object(
+                inductor_utils,
+                "_do_bench_using_profiling",
+                side_effect=fake_do_bench,
+            ):
+                result = inductor_utils.do_bench_using_profiling(
+                    lambda: calls.append("fn"),
+                    warmup=1,
+                    rep=2,
+                    is_vetted_benchmarking=True,
+                )
+        finally:
+            _bench.set_gpu_benchmark_lock_context(previous)
+
+        self.assertEqual(result, 3.0)
+        self.assertEqual(calls, ["enter", (1, 2, True), "fn", "exit"])
+
+    def test_benchmark_uses_inferred_cuda_device_context(self):
+        from torch._inductor.runtime import benchmarking as _bench
+
+        benchmarker = TritonBenchmarker()
+        orig = dict(_bench._BENCHMARK_DISPATCH)
+        entered_devices = []
+
+        @contextlib.contextmanager
+        def fake_cuda_device(device):
+            entered_devices.append(device)
+            yield
+
+        try:
+            _bench.register_benchmarker(
+                "cuda",
+                lambda self, f, *, warmup, rep, **kw: 7.0,
+                override=True,
+            )
+            with patch("torch.cuda.device", side_effect=fake_cuda_device):
+                result = benchmarker.benchmark(lambda: None, device="cuda:1")
+        finally:
+            _bench._BENCHMARK_DISPATCH.clear()
+            _bench._BENCHMARK_DISPATCH.update(orig)
+
+        self.assertEqual(result, 7.0)
+        self.assertEqual(entered_devices, [torch.device("cuda:1")])
+
+    def test_benchmark_gpu_with_cuda_graph_uses_gpu_benchmark_lock(self):
+        from torch._inductor.runtime import benchmarking as _bench
+
+        class FakeCUDAGraph:
+            def replay(self):
+                pass
+
+        benchmarker = Benchmarker()
+        calls = []
+
+        @contextlib.contextmanager
+        def custom_context():
+            calls.append("enter")
+            try:
+                yield
+            finally:
+                calls.append("exit")
+
+        previous = _bench.set_gpu_benchmark_lock_context(custom_context)
+        try:
+            with (
+                patch("torch.cuda.synchronize"),
+                patch("torch.cuda.CUDAGraph", FakeCUDAGraph),
+                patch("torch.cuda.graph", return_value=contextlib.nullcontext()),
+                patch.object(Benchmarker, "benchmark_gpu", return_value=9.0),
+            ):
+                result = benchmarker.benchmark_gpu_with_cuda_graph(
+                    lambda: calls.append("call")
+                )
+        finally:
+            _bench.set_gpu_benchmark_lock_context(previous)
+
+        self.assertEqual(result, 9.0)
+        self.assertEqual(calls, ["enter", "call", "call", "exit"])
 
     @unittest.skipIf(not HAS_GPU, "requires GPU")
     @parametrize(
